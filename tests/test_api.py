@@ -871,3 +871,182 @@ def test_api_vod_merge_errors_still_return_422():
 def test_api_vod_rejects_wrong_snapshot_count():
     assert vod_post([m3u(1)], "0", "1").status_code == 422
     assert vod_post([m3u(1)] * 31, "0", "1").status_code == 422
+
+
+# ------------------------------------------------------- API: /v1/fetch-plan
+
+def fetch_plan_post(snapshots, url=BASE_URL):
+    return client.post(
+        "/v1/fetch-plan",
+        json={"playlist_url": url, "snapshots": snapshots},
+    )
+
+
+def test_api_fetch_plan_merges_adjacent_ranges_and_orders_requests():
+    s0 = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:100",
+        "#EXTINF:2.000,",
+        "#EXT-X-BYTERANGE:100@0",
+        "big.ts",
+        "#EXTINF:1.500,",
+        "#EXT-X-BYTERANGE:50",  # implicit offset -> 100
+        "big.ts",
+        "#EXTINF:3.333,",
+        "clip.ts",
+    ]) + "\n"
+    s1 = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:102",
+        "#EXTINF:3.333,",
+        "clip.ts",
+        "#EXTINF:2.000,",
+        "#EXT-X-BYTERANGE:40@200",
+        "big.ts",
+    ]) + "\n"
+    resp = fetch_plan_post([s0, s1])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["playlist_url"] == BASE_URL
+    # big.ts [0,100) and [100,150) are adjacent -> one bytes=0-149 request;
+    # [200,240) stays separate. Requests follow first-involved sequence.
+    assert body["requests"] == [
+        {"uri": "https://cdn.example.com/live/big.ts", "range": "bytes=0-149"},
+        {"uri": "https://cdn.example.com/live/clip.ts", "range": None},
+        {"uri": "https://cdn.example.com/live/big.ts", "range": "bytes=200-239"},
+    ]
+    assert body["segments"] == [
+        {"sequence": 100, "request_index": 0, "offset": 0, "length": 100},
+        {"sequence": 101, "request_index": 0, "offset": 100, "length": 50},
+        {"sequence": 102, "request_index": 1, "offset": None, "length": None},
+        {"sequence": 103, "request_index": 2, "offset": 0, "length": 40},
+    ]
+
+
+def test_api_fetch_plan_full_resource_fetched_once_and_covers_fragments():
+    s0 = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:1.0,",
+        "#EXT-X-BYTERANGE:100@0",
+        "big.ts",
+        "#EXTINF:1.0,",
+        "big.ts",  # full resource -> the whole URI is fetched once
+        "#EXTINF:1.0,",
+        "#EXT-X-BYTERANGE:50@100",
+        "big.ts",
+    ]) + "\n"
+    resp = fetch_plan_post([s0, s0])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["requests"] == [
+        {"uri": "https://cdn.example.com/live/big.ts", "range": None},
+    ]
+    # Fragments sit at their original offset inside the whole-resource body.
+    assert body["segments"] == [
+        {"sequence": 0, "request_index": 0, "offset": 0, "length": 100},
+        {"sequence": 1, "request_index": 0, "offset": None, "length": None},
+        {"sequence": 2, "request_index": 0, "offset": 100, "length": 50},
+    ]
+
+
+def test_api_fetch_plan_dedupes_full_resource_across_snapshots():
+    snaps = [
+        m3u(2, media_sequence=0, uris=["a.ts", "b.ts"]),
+        m3u(2, media_sequence=2, uris=["a.ts", "c.ts"]),
+    ]
+    resp = fetch_plan_post(snaps)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["requests"] == [
+        {"uri": "https://cdn.example.com/live/a.ts", "range": None},
+        {"uri": "https://cdn.example.com/live/b.ts", "range": None},
+        {"uri": "https://cdn.example.com/live/c.ts", "range": None},
+    ]
+    assert body["segments"] == [
+        {"sequence": 0, "request_index": 0, "offset": None, "length": None},
+        {"sequence": 1, "request_index": 1, "offset": None, "length": None},
+        {"sequence": 2, "request_index": 0, "offset": None, "length": None},
+        {"sequence": 3, "request_index": 2, "offset": None, "length": None},
+    ]
+
+
+def test_api_fetch_plan_merges_overlapping_ranges():
+    s0 = m3u(2, media_sequence=0, byteranges={0: "100@0", 1: "80@60"})
+    resp = fetch_plan_post([s0, s0])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["requests"] == [{"uri": SEG_URL, "range": "bytes=0-139"}]
+    assert body["segments"] == [
+        {"sequence": 0, "request_index": 0, "offset": 0, "length": 100},
+        {"sequence": 1, "request_index": 0, "offset": 60, "length": 80},
+    ]
+
+
+def test_api_fetch_plan_keeps_disjoint_ranges_separate():
+    s0 = m3u(2, media_sequence=0, byteranges={0: "10@0", 1: "10@20"})
+    resp = fetch_plan_post([s0, s0])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["requests"] == [
+        {"uri": SEG_URL, "range": "bytes=0-9"},
+        {"uri": SEG_URL, "range": "bytes=20-29"},
+    ]
+    assert body["segments"] == [
+        {"sequence": 0, "request_index": 0, "offset": 0, "length": 10},
+        {"sequence": 1, "request_index": 1, "offset": 0, "length": 10},
+    ]
+
+
+def test_api_fetch_plan_rejects_non_http_segment_uri():
+    pl = "#EXTM3U\n#EXTINF:1.0,\nftp://cdn.example.com/seg.ts\n"
+    resp = fetch_plan_post([pl, pl])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "unsupported_uri"
+    assert body["sequence"] == 0
+
+
+def test_api_fetch_plan_rejects_ext_x_key_and_map():
+    pl = ('#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k.key"\n'
+          "#EXTINF:1,\na.ts\n")
+    resp = fetch_plan_post([pl, pl])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "unsupported_tag"
+    assert body["snapshot_index"] == 0
+
+    pl = '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:1,\na.ts\n'
+    resp = fetch_plan_post([m3u(1), pl])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "unsupported_tag"
+    assert body["snapshot_index"] == 1
+
+
+def test_api_fetch_plan_requires_absolute_http_playlist_url():
+    snaps = [m3u(1), m3u(1)]
+    assert fetch_plan_post(snaps, url="live/index.m3u8").status_code == 422
+    assert fetch_plan_post(snaps, url="ftp://cdn.example.com/x.m3u8").status_code == 422
+    assert fetch_plan_post(snaps, url="//cdn.example.com/x.m3u8").status_code == 422
+
+
+def test_api_fetch_plan_merge_errors_still_return_422():
+    resp = fetch_plan_post([m3u(1, media_sequence=0), m3u(1, media_sequence=7)])
+    assert resp.status_code == 422
+    assert resp.json()["error"] == "sequence_gap"
+
+    resp = fetch_plan_post([m3u(2, media_sequence=10), m3u(2, media_sequence=9)])
+    assert resp.status_code == 422
+    assert resp.json()["error"] == "sequence_rollback"
+
+    s0 = m3u(2, media_sequence=0)
+    s1 = m3u(2, media_sequence=1).replace("#EXTINF:1.10,", "#EXTINF:2.20,", 1)
+    resp = fetch_plan_post([s0, s1])
+    assert resp.status_code == 422
+    assert resp.json()["error"] == "overlap_conflict"
+
+
+def test_api_fetch_plan_rejects_wrong_snapshot_count():
+    assert fetch_plan_post([m3u(1)]).status_code == 422
+    assert fetch_plan_post([m3u(1)] * 31).status_code == 422

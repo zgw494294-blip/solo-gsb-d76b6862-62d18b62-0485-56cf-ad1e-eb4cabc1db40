@@ -13,11 +13,12 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from typing import Iterable, Optional, Sequence
 
-from .reconcile import ReconcileError, ReconciledSegment, reconcile
-
-# Encryption keys and init-segment maps cannot be restamped into a
-# self-contained VOD playlist, so snapshots carrying them are rejected.
-_FORBIDDEN_TAGS = ("#EXT-X-KEY", "#EXT-X-MAP")
+from .reconcile import (
+    ReconcileError,
+    ReconciledSegment,
+    reconcile,
+    reject_forbidden_tags,
+)
 
 
 @dataclass(frozen=True)
@@ -48,24 +49,6 @@ def _parse_bound(raw: str, field: str) -> Decimal:
             f"{field} must be a finite, non-negative decimal number of seconds, got {raw!r}",
         )
     return value
-
-
-def _reject_forbidden_tags(snapshots: Sequence[str]) -> None:
-    for index, raw in enumerate(snapshots):
-        for line in raw.splitlines():
-            token = line.strip()
-            if not token.startswith("#"):
-                continue
-            tag = token.split(":", 1)[0]
-            if tag in _FORBIDDEN_TAGS:
-                raise ReconcileError(
-                    "unsupported_tag",
-                    (
-                        f"snapshot {index} uses {tag}, which cannot be exported "
-                        "as a VOD playlist"
-                    ),
-                    snapshot_index=index,
-                )
 
 
 def render_vod_playlist(segments: Sequence[ReconciledSegment]) -> str:
@@ -117,7 +100,7 @@ def export_vod(
     """
 
     snapshot_list = list(snapshots)
-    _reject_forbidden_tags(snapshot_list)
+    reject_forbidden_tags(snapshot_list)
 
     from_sec = _parse_bound(from_raw, "from_sec")
     to_sec = _parse_bound(to_raw, "to_sec")

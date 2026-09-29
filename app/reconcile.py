@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from .hls import PlaylistParseError, Segment, parse_playlist
 
@@ -37,6 +37,29 @@ class ReconciledSegment:
     byte_length: Optional[int]
     start: Decimal
     end: Decimal
+
+
+# Encryption keys and init-segment maps cannot be carried into derived
+# artifacts (VOD playlists, fetch plans), so snapshots carrying them are
+# rejected before merging.
+FORBIDDEN_TAGS = ("#EXT-X-KEY", "#EXT-X-MAP")
+
+
+def reject_forbidden_tags(snapshots: Sequence[str]) -> None:
+    """Raise ``unsupported_tag`` if any snapshot uses EXT-X-KEY / EXT-X-MAP."""
+
+    for index, raw in enumerate(snapshots):
+        for line in raw.splitlines():
+            token = line.strip()
+            if not token.startswith("#"):
+                continue
+            tag = token.split(":", 1)[0]
+            if tag in FORBIDDEN_TAGS:
+                raise ReconcileError(
+                    "unsupported_tag",
+                    f"snapshot {index} uses {tag}, which is not supported",
+                    snapshot_index=index,
+                )
 
 
 def _segments_equal(existing: Segment, candidate: Segment) -> bool:

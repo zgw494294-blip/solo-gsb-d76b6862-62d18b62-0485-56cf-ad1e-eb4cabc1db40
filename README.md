@@ -5,7 +5,7 @@
 连续、带精确小数起止秒数的切片时间线。**完全离线**：服务不发起任何网络请求，
 `playlist_url` 仅用于解析相对 URI。
 
-提供三个接口：
+提供四个接口：
 
 - `POST /v1/reconcile`：复原整条切片时间线（序号、URI、精确十进制相对起止秒数、
   字节范围、不连续计数）。
@@ -14,6 +14,9 @@
   返回片段序号、URI、UTC 起止时间与精确十进制片内偏移。
 - `POST /v1/vod`：把直播窗口按十进制秒区间 `[from_sec, to_sec)` 导出为一份
   **VOD 媒体清单文本**，并返回实际覆盖起止与两端多带的秒数。
+- `POST /v1/fetch-plan`：为复原后的窗口生成**媒体片段获取计划**——去重合并后的
+  资源请求列表（完整资源 / `Range: bytes=起点-终点`）及每个片段到请求响应体的
+  逐段映射。
 
 ## 单条命令启动
 
@@ -23,7 +26,7 @@ docker compose up --build
 
 服务监听 **8000** 端口（容器内 `8000`，映射到宿主机 `8000`）：
 
-- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`
+- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`、`POST http://localhost:8000/v1/fetch-plan`
 - 健康检查：`GET http://localhost:8000/healthz`
 - 交互式文档：`http://localhost:8000/docs`
 
@@ -311,6 +314,80 @@ curl -s http://localhost:8000/v1/vod \
   }'
 ```
 
+## `POST /v1/fetch-plan`：生成媒体片段获取计划
+
+请求体与 `/v1/reconcile` 相同（`playlist_url` + 按抓取时间排序的 `snapshots`，
+合并、回退、空洞、重叠冲突等规则完全一致），离线返回抓取整条复原窗口所需的
+**资源请求列表**及**逐段映射**——服务本身不发起任何网络请求。
+
+| 字段 | 说明 |
+| --- | --- |
+| `playlist_url` | **必须是绝对 `http(s)` URL**；仅作相对 URI 的解析基址，不会被请求 |
+| `snapshots` | 同 `/v1/reconcile`，按抓取时间排序，长度 2～30，每份 1～100 段 |
+
+### 请求生成规则
+
+1. **完整资源去重**：相同绝对 HTTP(S) URI 的完整资源（无 `EXT-X-BYTERANGE`
+   的段）只请求**一次**（不带 `Range` 头），该响应同时**覆盖**同 URI 的
+   字节范围片段。
+2. **字节区间合并**：某 URI 没有任何完整资源引用时，把该 URI 的全部字节区间
+   按偏移排序，**重叠或相邻**（前区间终点 + 1 ≥ 后区间起点）的区间合并为一个
+   区间，每个合并区间生成一个 `bytes=起点-终点` 请求（终点为闭区间）。
+3. **请求排序**：`requests` 按**首次涉及该请求的片段序号**排序。
+4. **逐段映射**：`segments` 按序号给出每段的 `request_index`（指向
+   `requests` 的下标）、片段数据**在该请求响应体内的起始字节** `offset` 与
+   `length`。字节范围片段的 `offset` = 原偏移 − 请求起点（完整资源请求的起点
+   视为 0）；完整资源片段的 `offset` 与 `length` 为 `null`（整个响应体即片段）。
+
+### 响应（200）
+
+```json
+{
+  "playlist_url": "https://cdn.example.com/live/index.m3u8",
+  "requests": [
+    {"uri": "https://cdn.example.com/live/big.ts", "range": "bytes=0-149"},
+    {"uri": "https://cdn.example.com/live/clip.ts", "range": null},
+    {"uri": "https://cdn.example.com/live/big.ts", "range": "bytes=200-239"}
+  ],
+  "segments": [
+    {"sequence": 100, "request_index": 0, "offset": 0, "length": 100},
+    {"sequence": 101, "request_index": 0, "offset": 100, "length": 50},
+    {"sequence": 102, "request_index": 1, "offset": null, "length": null},
+    {"sequence": 103, "request_index": 2, "offset": 0, "length": 40}
+  ]
+}
+```
+
+- 所有请求均为 HTTP `GET`；`range` 非空时携带 `Range: <range>` 请求头。
+- 下载后按 `segments` 映射切片：请求 `request_index` 的响应体中
+  `[offset, offset + length)` 即该片段数据；`offset`/`length` 为 `null` 时
+  整个响应体即该片段。
+
+错误均为 HTTP 422：
+
+| `error` | 触发条件 |
+| --- | --- |
+| `unsupported_uri` | 片段解析后的 URI 不是绝对 http(s) URI，带 `sequence` |
+| `unsupported_tag` | 快照含 `#EXT-X-KEY` / `#EXT-X-MAP`，带 `snapshot_index` |
+| `invalid_request` | `playlist_url` 不是绝对 http(s) URL、快照数量不合法、字段缺失/类型错误等 |
+| 其余合并类错误 | `sequence_rollback`、`sequence_gap`、`overlap_conflict`、`invalid_playlist` 等，同 `/v1/reconcile` |
+
+```bash
+curl -s http://localhost:8000/v1/fetch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playlist_url": "https://cdn.example.com/live/index.m3u8",
+    "snapshots": [
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:2.000,\n#EXT-X-BYTERANGE:100@0\nbig.ts\n#EXTINF:1.500,\n#EXT-X-BYTERANGE:50\nbig.ts\n#EXTINF:3.333,\nclip.ts\n",
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:102\n#EXTINF:3.333,\nclip.ts\n#EXTINF:2.000,\n#EXT-X-BYTERANGE:40@200\nbig.ts\n"
+    ]
+  }'
+```
+
+上面示例中 `big.ts` 的 `[0,100)` 与 `[100,150)` 相邻，合并为一个
+`bytes=0-149` 请求；`[200,240)` 不相邻，单独生成 `bytes=200-239`；
+`clip.ts` 是完整资源，只请求一次。
+
 ## 快速验证
 
 ```bash
@@ -330,9 +407,10 @@ curl -s http://localhost:8000/v1/reconcile \
 ```
 app/
   hls.py         # 离线清单解析（序号 / 时长 / 断点 / 字节范围 / URI / PDT 锚点）
-  reconcile.py   # 跨快照合并、连续性与一致性校验、时间轴计算
+  reconcile.py   # 跨快照合并、连续性与一致性校验、时间轴计算、禁用标签检查
   locate.py      # PDT 精确 UTC 解析/推算、锚点一致性校验、半开区间定位
   vod.py         # 按秒区间选段、VOD 清单渲染（VERSION:4 / ENDLIST / 多带秒数）
+  fetchplan.py   # 资源请求去重与字节区间合并、逐段响应体映射
   main.py        # FastAPI 路由、请求/响应模型、422/404 错误处理
 tests/test_api.py
 Dockerfile
