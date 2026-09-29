@@ -50,7 +50,14 @@ def _parse_bound(raw: str, field: str) -> Decimal:
     return value
 
 
-def _reject_forbidden_tags(snapshots: Sequence[str]) -> None:
+def reject_unsupported_tags(snapshots: Sequence[str], *, operation: str = "exported") -> None:
+    """Reject snapshots carrying encryption keys or init-segment maps.
+
+    Both features introduce additional resources (key / init segment) that
+    cannot be represented by a segment-only offline plan; shared by the VOD
+    export (``operation="exported as a VOD playlist"``) and the fetch planner.
+    """
+
     for index, raw in enumerate(snapshots):
         for line in raw.splitlines():
             token = line.strip()
@@ -60,10 +67,7 @@ def _reject_forbidden_tags(snapshots: Sequence[str]) -> None:
             if tag in _FORBIDDEN_TAGS:
                 raise ReconcileError(
                     "unsupported_tag",
-                    (
-                        f"snapshot {index} uses {tag}, which cannot be exported "
-                        "as a VOD playlist"
-                    ),
+                    f"snapshot {index} uses {tag}, which cannot be {operation}",
                     snapshot_index=index,
                 )
 
@@ -117,7 +121,7 @@ def export_vod(
     """
 
     snapshot_list = list(snapshots)
-    _reject_forbidden_tags(snapshot_list)
+    reject_unsupported_tags(snapshot_list, operation="exported as a VOD playlist")
 
     from_sec = _parse_bound(from_raw, "from_sec")
     to_sec = _parse_bound(to_raw, "to_sec")

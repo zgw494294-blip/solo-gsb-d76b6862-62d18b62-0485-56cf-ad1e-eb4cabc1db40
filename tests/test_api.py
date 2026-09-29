@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.hls import PlaylistParseError, parse_playlist
+from app.fetch import plan_fetches
 from app.locate import (
     LocateError,
     format_program_time,
@@ -871,3 +872,208 @@ def test_api_vod_merge_errors_still_return_422():
 def test_api_vod_rejects_wrong_snapshot_count():
     assert vod_post([m3u(1)], "0", "1").status_code == 422
     assert vod_post([m3u(1)] * 31, "0", "1").status_code == 422
+
+
+# ----------------------------------------------------- API: /v1/fetch-plan
+
+def fetch_post(snapshots, url=BASE_URL):
+    return client.post(
+        "/v1/fetch-plan",
+        json={"playlist_url": url, "snapshots": snapshots},
+    )
+
+
+def _ranged_playlist():
+    # Four byterange segments in one resource; implicit offsets are resolved
+    # by the parser: [0,100) [100,150) [300,400) [400,500).
+    return "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:100@0", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:50", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:100@300", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:100@400", "big.ts",
+    ]) + "\n"
+
+
+def test_fetch_plan_merges_adjacent_and_overlapping_ranges():
+    # [0,100)+[100,150) touch -> [0,150); [300,400)+[400,500) touch -> [300,500).
+    plan = plan_fetches(BASE_URL, [_ranged_playlist(), _ranged_playlist()])
+    assert [(r.uri, r.range_header) for r in plan.requests] == [
+        (SEG_URL.replace("seg.ts", "big.ts"), "bytes=0-149"),
+        ("https://cdn.example.com/live/big.ts", "bytes=300-499"),
+    ]
+    assert [(s.sequence, s.request_index, s.body_offset, s.length) for s in plan.segments] == [
+        (0, 0, 0, 100),
+        (1, 0, 100, 50),
+        (2, 1, 0, 100),
+        (3, 1, 100, 100),
+    ]
+
+
+def test_fetch_plan_overlapping_ranges_merge_into_one_request():
+    text = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:100@0", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:100@50", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:200@200", "big.ts",
+    ]) + "\n"
+    # [0,100)+[50,150) overlap -> [0,150); [200,400) is 51 bytes away -> own request.
+    plan = plan_fetches(BASE_URL, [text, text])
+    assert [r.range_header for r in plan.requests] == ["bytes=0-149", "bytes=200-399"]
+    mapping = {s.sequence: s for s in plan.segments}
+    assert (mapping[0].request_index, mapping[0].body_offset) == (0, 0)
+    assert (mapping[1].request_index, mapping[1].body_offset) == (0, 50)
+    assert (mapping[2].request_index, mapping[2].body_offset) == (1, 0)
+
+
+def test_fetch_plan_full_resource_requested_once_covers_ranged_segments():
+    text = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:1.0,", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:50@100", "big.ts",
+        "#EXTINF:1.0,", "other.ts",
+    ]) + "\n"
+    plan = plan_fetches(BASE_URL, [text, text])
+    # big.ts is referenced whole -> exactly one request, no Range, for both segs.
+    big_requests = [r for r in plan.requests if r.uri.endswith("big.ts")]
+    assert len(big_requests) == 1 and big_requests[0].range_header is None
+    other_requests = [r for r in plan.requests if r.uri.endswith("other.ts")]
+    assert len(other_requests) == 1 and other_requests[0].range_header is None
+    mapping = {s.sequence: s for s in plan.segments}
+    assert (mapping[0].body_offset, mapping[0].length) == (None, None)
+    # The ranged segment is covered by the full-resource request as well.
+    assert mapping[1].request_index == big_requests[0].index
+    assert (mapping[1].body_offset, mapping[1].length) == (None, None)
+    assert mapping[2].request_index == other_requests[0].index
+
+
+def test_fetch_plan_distinct_uris_are_separate_requests():
+    snaps = [
+        m3u(2, media_sequence=0, uris=["a.ts", "b.ts"]),
+        m3u(2, media_sequence=2, uris=["c.ts", "d.ts"]),
+    ]
+    plan = plan_fetches(BASE_URL, snaps)
+    assert [r.index for r in plan.requests] == [0, 1, 2, 3]
+    assert all(r.range_header is None for r in plan.requests)
+    assert [s.request_index for s in plan.segments] == [0, 1, 2, 3]
+    assert all(s.body_offset is None and s.length is None for s in plan.segments)
+
+
+def test_fetch_plan_requests_sorted_by_first_segment_sequence():
+    # Two URIs interleaved; ranges for big.ts first touched at seq 0 and seq 2,
+    # clip.ts first touched at seq 1; request order follows the timeline.
+    text = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:10@0", "big.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:20@0", "clip.ts",
+        "#EXTINF:1.0,", "#EXT-X-BYTERANGE:10@500", "big.ts",
+    ]) + "\n"
+    plan = plan_fetches(BASE_URL, [text, text])
+    assert [r.range_header for r in plan.requests] == [
+        "bytes=0-9",     # first touched by sequence 0
+        "bytes=0-19",    # first touched by sequence 1
+        "bytes=500-509", # first touched by sequence 2
+    ]
+    assert [s.request_index for s in plan.segments] == [0, 1, 2]
+
+
+def test_fetch_plan_deduplicates_same_uri_across_overlapping_snapshots():
+    # Sliding window; all five segments share seg.ts as full resources.
+    snaps = [m3u(3, media_sequence=0), m3u(3, media_sequence=2)]
+    plan = plan_fetches(BASE_URL, snaps)
+    assert len(plan.requests) == 1
+    assert plan.requests[0].range_header is None
+    assert [s.sequence for s in plan.segments] == [0, 1, 2, 3, 4]
+    assert {s.request_index for s in plan.segments} == {0}
+
+
+def test_fetch_plan_rejects_non_http_segment_uri():
+    snaps = [
+        m3u(2, media_sequence=0, uris=["a.ts", "file:///etc/passwd"]),
+        m3u(2, media_sequence=2),
+    ]
+    with pytest.raises(ReconcileError) as exc:
+        plan_fetches(BASE_URL, snaps)
+    assert exc.value.code == "unsupported_uri"
+    assert exc.value.sequence == 1
+
+
+def test_fetch_plan_rejects_ext_x_key_and_map():
+    for tag in ('#EXT-X-KEY:METHOD=AES-128,URI="k.key"', '#EXT-X-MAP:URI="init.mp4"'):
+        pl = f"#EXTM3U\n{tag}\n#EXTINF:1,\na.ts\n"
+        with pytest.raises(ReconcileError) as exc:
+            plan_fetches(BASE_URL, [pl, pl])
+        assert exc.value.code == "unsupported_tag"
+
+
+def test_fetch_plan_reuses_merge_rules():
+    with pytest.raises(ReconcileError) as exc:
+        plan_fetches(BASE_URL, [m3u(1, media_sequence=0), m3u(1, media_sequence=5)])
+    assert exc.value.code == "sequence_gap"
+
+
+def test_api_fetch_plan_happy_path():
+    resp = fetch_post([_ranged_playlist(), _ranged_playlist()])
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "playlist_url": BASE_URL,
+        "request_count": 2,
+        "segment_count": 4,
+        "requests": [
+            {"index": 0, "uri": "https://cdn.example.com/live/big.ts",
+             "range": "bytes=0-149"},
+            {"index": 1, "uri": "https://cdn.example.com/live/big.ts",
+             "range": "bytes=300-499"},
+        ],
+        "segments": [
+            {"sequence": 0, "request_index": 0, "body_offset": 0, "length": 100},
+            {"sequence": 1, "request_index": 0, "body_offset": 100, "length": 50},
+            {"sequence": 2, "request_index": 1, "body_offset": 0, "length": 100},
+            {"sequence": 3, "request_index": 1, "body_offset": 100, "length": 100},
+        ],
+    }
+
+
+def test_api_fetch_plan_full_resources_have_null_range_and_mapping():
+    snaps = [m3u(2, media_sequence=0), m3u(2, media_sequence=2)]
+    resp = fetch_post(snaps)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["request_count"] == 1
+    assert body["requests"][0]["range"] is None
+    assert body["segments"][0] == {
+        "sequence": 0,
+        "request_index": 0,
+        "body_offset": None,
+        "length": None,
+    }
+
+
+def test_api_fetch_plan_rejects_non_http_playlist_url():
+    snaps = [m3u(1), m3u(1)]
+    assert fetch_post(snaps, url="live/index.m3u8").status_code == 422
+    assert fetch_post(snaps, url="ftp://cdn.example.com/x.m3u8").status_code == 422
+
+
+def test_api_fetch_plan_unsupported_tag_returns_422():
+    pl = '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k.key"\n#EXTINF:1,\na.ts\n'
+    resp = fetch_post([pl, pl])
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "unsupported_tag"
+    assert body["snapshot_index"] == 0
+
+
+def test_api_fetch_plan_merge_errors_return_422():
+    resp = fetch_post([m3u(1, media_sequence=10), m3u(1, media_sequence=9)])
+    assert resp.status_code == 422
+    assert resp.json()["error"] == "sequence_rollback"
+
+
+def test_api_fetch_plan_rejects_wrong_snapshot_count():
+    assert fetch_post([m3u(1)]).status_code == 422
+    assert fetch_post([m3u(1)] * 31).status_code == 422

@@ -5,7 +5,7 @@
 连续、带精确小数起止秒数的切片时间线。**完全离线**：服务不发起任何网络请求，
 `playlist_url` 仅用于解析相对 URI。
 
-提供三个接口：
+提供四个接口：
 
 - `POST /v1/reconcile`：复原整条切片时间线（序号、URI、精确十进制相对起止秒数、
   字节范围、不连续计数）。
@@ -14,6 +14,9 @@
   返回片段序号、URI、UTC 起止时间与精确十进制片内偏移。
 - `POST /v1/vod`：把直播窗口按十进制秒区间 `[from_sec, to_sec)` 导出为一份
   **VOD 媒体清单文本**，并返回实际覆盖起止与两端多带的秒数。
+- `POST /v1/fetch-plan`：为复原后的窗口离线生成**媒体片段获取计划**——去重合并
+  后的 HTTP 资源请求列表（完整资源请求 / `Range` 字节范围请求），以及每段在响应体
+  中的字节映射。
 
 ## 单条命令启动
 
@@ -23,7 +26,7 @@ docker compose up --build
 
 服务监听 **8000** 端口（容器内 `8000`，映射到宿主机 `8000`）：
 
-- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`
+- API：`POST http://localhost:8000/v1/reconcile`、`POST http://localhost:8000/v1/locate`、`POST http://localhost:8000/v1/vod`、`POST http://localhost:8000/v1/fetch-plan`
 - 健康检查：`GET http://localhost:8000/healthz`
 - 交互式文档：`http://localhost:8000/docs`
 
@@ -311,6 +314,100 @@ curl -s http://localhost:8000/v1/vod \
   }'
 ```
 
+## `POST /v1/fetch-plan`：生成媒体片段获取计划
+
+请求体与 `/v1/reconcile` 相同（`playlist_url` + 按时间排序的 `snapshots`），
+沿用完全相同的合并与错误规则，**离线**返回一份「资源请求 + 逐段映射」计划：
+
+```json
+{
+  "playlist_url": "https://cdn.example.com/live/index.m3u8",
+  "snapshots": ["#EXTM3U\n...", "#EXTM3U\n..."]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `playlist_url` | **必须是绝对 `http(s)` URL**；仅作相对 URI 的解析基址，不会被请求 |
+| `snapshots` | 同 `/v1/reconcile`，按抓取时间排序，长度 2～30，每份 1～100 段 |
+
+### 请求合并规则
+
+1. **先合并时间线**：执行与 `/v1/reconcile` 完全相同的合并（回退、空洞、重叠
+   冲突等原样返回 422）。
+2. **拒绝非 HTTP(S) 片段 URI**：合并后任一片段的绝对 URI 不是
+   `http`/`https` → 422（`unsupported_uri`，带 `sequence`）。
+3. **拒绝密钥与初始化段**：任一份快照含 `#EXT-X-KEY` 或 `#EXT-X-MAP` → 422
+   （`unsupported_tag`，带 `snapshot_index`）。
+4. **完整资源引用**：某段没有 `EXT-X-BYTERANGE` 即表示引用其 URI 的**完整资源**。
+   **相同绝对 HTTP(S) URI 的完整资源只请求一次**（不带 `Range` 的普通 GET），
+   该请求同时覆盖同一 URI 上的所有字节范围片段。
+5. **仅字节范围引用**：某 URI 没有任何完整资源引用时，把同 URI 各段的字节半开
+   区间 `[offset, offset+length)` **按偏移合并所有重叠或首尾相邻的区间**
+   （`next_start ≤ prev_end` 即合并），每个合并区间生成一个
+   `Range: bytes=起点-终点`（终点为闭区间）请求。
+6. **请求排序与索引**：请求 `index` 从 0 起，**按首次涉及到的片段序号**从小到大
+   分配（沿合并时间线扫描，第一次用到该请求时编号）。
+
+### 逐段映射
+
+响应的 `segments` 按片段序号排列，逐段给出四项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `sequence` | 片段媒体序号 |
+| `request_index` | 承载该片段的请求索引（对应 `requests[].index`） |
+| `body_offset` | 该片段在**响应体**内的起始字节；字节范围片段为「原偏移 − 请求起点」，完整资源片段为 `null` |
+| `length` | 该片段在响应体内的字节长度；完整资源片段为 `null` |
+
+### 响应（200）
+
+```json
+{
+  "playlist_url": "https://cdn.example.com/live/index.m3u8",
+  "request_count": 2,
+  "segment_count": 4,
+  "requests": [
+    {"index": 0, "uri": "https://cdn.example.com/live/big.ts", "range": "bytes=0-149"},
+    {"index": 1, "uri": "https://cdn.example.com/live/big.ts", "range": "bytes=300-499"}
+  ],
+  "segments": [
+    {"sequence": 0, "request_index": 0, "body_offset": 0,   "length": 100},
+    {"sequence": 1, "request_index": 0, "body_offset": 100, "length": 50},
+    {"sequence": 2, "request_index": 1, "body_offset": 0,   "length": 100},
+    {"sequence": 3, "request_index": 1, "body_offset": 100, "length": 100}
+  ]
+}
+```
+
+- `requests[].range`：完整资源请求为 `null`（不发送 `Range` 头）；字节范围请求为
+  可直接作为 `Range` 头值的 `bytes=起点-终点`。
+- 上例中序号 0/1 的范围 `[0,100)` 与 `[100,150)` 首尾相邻，合并为一次
+  `bytes=0-149`；序号 2/3 的 `[300,400)` 与 `[400,500)` 合并为 `bytes=300-499`。
+- 同 URI 完整资源 + 字节范围混用时，该 URI 只产生一个完整资源请求，相关各段的
+  `body_offset` / `length` 均为 `null`。
+
+错误均为 HTTP 422：
+
+| `error` | 触发条件 |
+| --- | --- |
+| `unsupported_uri` | 合并后存在非 `http(s)` 的片段绝对 URI，带 `sequence` |
+| `unsupported_tag` | 快照含 `#EXT-X-KEY` / `#EXT-X-MAP`，带 `snapshot_index` |
+| `invalid_request` | `playlist_url` 不是绝对 http(s) URL、快照数量不合法、字段缺失/类型错误等 |
+| 其余合并类错误 | `sequence_rollback`、`sequence_gap`、`overlap_conflict`、`invalid_playlist` 等，同 `/v1/reconcile` |
+
+```bash
+curl -s http://localhost:8000/v1/fetch-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playlist_url": "https://cdn.example.com/live/index.m3u8",
+    "snapshots": [
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\n#EXT-X-BYTERANGE:100@0\nbig.ts\n#EXTINF:1.0,\n#EXT-X-BYTERANGE:50\nbig.ts\n#EXTINF:1.0,\nclip.ts\n",
+      "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:1.0,\nclip.ts\n#EXTINF:1.0,\nnxt.ts\n"
+    ]
+  }'
+```
+
 ## 快速验证
 
 ```bash
@@ -333,6 +430,7 @@ app/
   reconcile.py   # 跨快照合并、连续性与一致性校验、时间轴计算
   locate.py      # PDT 精确 UTC 解析/推算、锚点一致性校验、半开区间定位
   vod.py         # 按秒区间选段、VOD 清单渲染（VERSION:4 / ENDLIST / 多带秒数）
+  fetch.py       # 完整/字节范围请求去重合并、Range 请求生成、逐段响应体映射
   main.py        # FastAPI 路由、请求/响应模型、422/404 错误处理
 tests/test_api.py
 Dockerfile

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic import field_validator
 
 from .hls import PlaylistParseError
+from .fetch import plan_fetches
 from .locate import (
     LocateError,
     format_program_time,
@@ -93,6 +94,16 @@ class VodRequest(ReconcileRequest):
         return value
 
 
+class FetchPlanRequest(ReconcileRequest):
+    @field_validator("playlist_url")
+    @classmethod
+    def _url_absolute_http(cls, value: str) -> str:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("playlist_url must be an absolute http(s) URL")
+        return value
+
+
 class SegmentOut(BaseModel):
     sequence: int
     uri: str
@@ -131,6 +142,27 @@ class VodResponse(BaseModel):
     playlist: str
 
 
+class FetchRequestOut(BaseModel):
+    index: int
+    uri: str
+    range: Optional[str] = None
+
+
+class FetchSegmentOut(BaseModel):
+    sequence: int
+    request_index: int
+    body_offset: Optional[int]
+    length: Optional[int]
+
+
+class FetchPlanResponse(BaseModel):
+    playlist_url: str
+    request_count: int
+    segment_count: int
+    requests: list[FetchRequestOut]
+    segments: list[FetchSegmentOut]
+
+
 class ErrorDetail(BaseModel):
     snapshot_index: Optional[int] = None
     sequence: Optional[int] = None
@@ -148,8 +180,9 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Reconstruct a contiguous segment timeline from ordered HLS media "
-        "playlist snapshots, locate segments by program time, and export "
-        "time ranges as VOD playlists — entirely offline."
+        "playlist snapshots, locate segments by program time, export time "
+        "ranges as VOD playlists, and plan offline media fetch requests — "
+        "entirely offline."
     ),
 )
 
@@ -259,4 +292,27 @@ async def vod_endpoint(payload: VodRequest) -> VodResponse:
         tail_extra_sec=format(window.tail_extra, "f"),
         segment_count=window.segment_count,
         playlist=window.playlist,
+    )
+
+
+@app.post("/v1/fetch-plan", response_model=FetchPlanResponse)
+async def fetch_plan_endpoint(payload: FetchPlanRequest) -> FetchPlanResponse:
+    plan = plan_fetches(payload.playlist_url, payload.snapshots)
+    return FetchPlanResponse(
+        playlist_url=payload.playlist_url,
+        request_count=len(plan.requests),
+        segment_count=len(plan.segments),
+        requests=[
+            FetchRequestOut(index=request.index, uri=request.uri, range=request.range_header)
+            for request in plan.requests
+        ],
+        segments=[
+            FetchSegmentOut(
+                sequence=segment.sequence,
+                request_index=segment.request_index,
+                body_offset=segment.body_offset,
+                length=segment.length,
+            )
+            for segment in plan.segments
+        ],
     )
